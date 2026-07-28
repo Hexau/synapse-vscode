@@ -1,0 +1,191 @@
+{
+  "name": "synapse-vscode",
+  "displayName": "Synapse",
+  "publisher": "synapse-local",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/local/synapse-vscode"
+  },
+  "description": "Synapse AI assistant inside VS Code — real-time editor context",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "synapse-sidebar",
+          "title": "Synapse",
+          "icon": "media/synapse.svg"
+        }
+      ]
+    },
+    "views": {
+      "synapse-sidebar": [
+        {
+          "type": "webview",
+          "id": "synapse.chatView",
+          "name": "Chat"
+        },
+        {
+          "id": "synapse.hooksView",
+          "name": "Agent Hooks"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "synapse.createHook",
+          "when": "view == synapse.hooksView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "synapse.refreshHooks",
+          "when": "view == synapse.hooksView",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "synapse.runHook",
+          "when": "view == synapse.hooksView && viewItem =~ /^synapseHook(Builtin|Project)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "synapse.duplicateHook",
+          "when": "view == synapse.hooksView && viewItem =~ /^synapseHookBuiltin/",
+          "group": "inline@2"
+        },
+        {
+          "command": "synapse.duplicateHook",
+          "when": "view == synapse.hooksView && viewItem =~ /^synapseHookProject/"
+        },
+        {
+          "command": "synapse.openHookFile",
+          "when": "view == synapse.hooksView && viewItem =~ /^synapseHookProject/",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "synapse.openPanel",
+        "title": "Synapse: Open Chat"
+      },
+      {
+        "command": "synapse.setContextId",
+        "title": "Synapse: Set Context ID"
+      },
+      {
+        "command": "synapse.attachFile",
+        "title": "Synapse: Attach File to Chat",
+        "icon": "$(paperclip)"
+      },
+      {
+        "command": "synapse.clearAttachments",
+        "title": "Synapse: Clear Queued Attachments"
+      },
+      {
+        "command": "synapse.setApiToken",
+        "title": "Synapse: Set API Token"
+      },
+      {
+        "command": "synapse.refreshHooks",
+        "title": "Synapse: Refrescar hooks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "synapse.runHook",
+        "title": "Synapse: Ejecutar hook",
+        "icon": "$(play)"
+      },
+      {
+        "command": "synapse.showHookPrompt",
+        "title": "Synapse: Ver prompt del hook"
+      },
+      {
+        "command": "synapse.createHook",
+        "title": "Synapse: Crear hook",
+        "icon": "$(add)"
+      },
+      {
+        "command": "synapse.duplicateHook",
+        "title": "Duplicar como hook del proyecto",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "synapse.openHookFile",
+        "title": "Abrir archivo del hook",
+        "icon": "$(go-to-file)"
+      }
+    ],
+    "configuration": {
+      "title": "Synapse",
+      "properties": {
+        "synapse.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:5000",
+          "description": "URL of the running Synapse server"
+        },
+        "synapse.contextId": {
+          "type": "string",
+          "default": "",
+          "description": "Synapse context ID (auto-filled on first use)"
+        },
+        "synapse.sendEditorContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically send active file and cursor position to Synapse"
+        },
+        "synapse.sendDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send linter errors and warnings to Synapse"
+        },
+        "synapse.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "API token for this account (required in multi-user mode; get it from /api/my_account after logging into the WebUI, or via 'Synapse: Set API Token')"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "synapse.openPanel",
+        "key": "ctrl+shift+s",
+        "mac": "cmd+shift+s"
+      },
+      {
+        "command": "synapse.attachFile",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "tsc -p ./ && node --test out/test/**/*.test.js",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "@synapse/protocol": "file:vendor/synapse-protocol-0.1.0.tgz",
+    "socket.io-client": "^4.7.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.0"
+  }
+}
