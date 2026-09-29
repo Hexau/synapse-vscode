@@ -200,8 +200,20 @@ export function activate(context: vscode.ExtensionContext) {
     );
     hooksProvider.refresh();
 
-    // Wire context_id changes → CLI client
-    watcher.setContextIdCallback((id) => cli?.updateContextId(id));
+    // Wire context_id changes → CLI client, "hay sesión" context key (oculta
+    // la vista de Hooks entera cuando no hay sesión — ver el "when" en
+    // package.json de synapse.hooksView, no solo el mensaje interno de la
+    // vista que ya existía) y refresco del árbol de hooks.
+    watcher.setContextIdCallback((id) => {
+        cli?.updateContextId(id);
+        vscode.commands.executeCommand('setContext', 'synapse.hasSession', !!id);
+        hooksProvider?.refresh();
+        // Self-heal: if the sidebar's iframe was built before this id was
+        // ready (see panel.ts's buildFrameUrl()/syncContextId()), rebuild it
+        // now instead of leaving the WebUI stuck on its own orphan chat id
+        // for the rest of the session.
+        provider?.syncContextId();
+    });
 
     // Apply context id: manual override from settings if present, otherwise
     // an id auto-derived from hostname + workspace path (no user action needed).
@@ -460,12 +472,21 @@ async function followHookRun(
     report: (label: string) => void,
     token: vscode.CancellationToken
 ): Promise<void> {
-    const IDLE_LIMIT = 8;   // ~24 s sin eventos nuevos ⇒ se da por terminada
+    // `running` (from log_tail) is the authoritative "still going" signal. The
+    // old idle heuristic gave up after ~24 s of event silence, but a single
+    // openwiki LLM turn routinely runs longer than that with no new log entries
+    // — so the indicator vanished mid-run and the user couldn't tell a live
+    // run from a finished one. Now we keep following while the server reports
+    // the run's task alive, no matter how slow a turn is.
     const INTERVAL_MS = 3000;
+    const STARTUP_GRACE = 10;        // ~30 s for the task to spin up before we give up
+    const IDLE_LIMIT_FALLBACK = 200; // ~10 min, only for an old backend with no `running`
     let after = 0;
     let idle = 0;
+    let startupWait = 0;
+    let sawRunning = false;
 
-    while (!token.isCancellationRequested && idle < IDLE_LIMIT) {
+    while (!token.isCancellationRequested) {
         await new Promise((r) => setTimeout(r, INTERVAL_MS));
         if (token.isCancellationRequested) { return; }
         try {
@@ -477,21 +498,39 @@ async function followHookRun(
                 },
                 body: JSON.stringify({ context_id: contextId, after, limit: 50 }),
             });
-            if (!res.ok) { idle++; continue; }
-            const data = (await res.json()) as { events?: LogEvent[]; last_sequence?: number };
+            if (!res.ok) { idle++; if (idle >= IDLE_LIMIT_FALLBACK) { return; } continue; }
+            const data = (await res.json()) as {
+                events?: LogEvent[]; last_sequence?: number; running?: boolean;
+            };
             const events = data.events || [];
-            if (!events.length) { idle++; continue; }
 
-            idle = 0;
-            after = data.last_sequence ?? after;
-            for (let i = events.length - 1; i >= 0; i--) {
-                const label = progressLabel(events[i]);
-                if (label) { report(label); break; }
+            if (events.length) {
+                after = data.last_sequence ?? after;
+                for (let i = events.length - 1; i >= 0; i--) {
+                    const label = progressLabel(events[i]);
+                    if (label) { report(label); break; }
+                }
+            }
+
+            if (data.running === true) {
+                sawRunning = true;
+                idle = 0;
+            } else if (data.running === false) {
+                // Authoritative end — but only trust it once the run has
+                // actually started, so we don't quit in the gap between launch
+                // and the task spinning up.
+                if (sawRunning) { return; }
+                if (++startupWait >= STARTUP_GRACE) { return; }
+            } else {
+                // Old backend without `running`: fall back to the idle
+                // heuristic, but with a tolerance long enough that a slow turn
+                // no longer looks like completion.
+                if (events.length) { idle = 0; } else if (++idle >= IDLE_LIMIT_FALLBACK) { return; }
             }
         } catch {
             // Un fallo de red en el sondeo no debe abortar nada: la corrida
             // sigue viva en el servidor aunque aquí perdamos la señal.
-            idle++;
+            if (++idle >= IDLE_LIMIT_FALLBACK) { return; }
         }
     }
 }

@@ -38,7 +38,8 @@
         },
         {
           "id": "synapse.hooksView",
-          "name": "Agent Hooks"
+          "name": "Agent Hooks",
+          "when": "synapse.hasSession"
         }
       ]
     },
@@ -180,6 +181,7 @@
   },
   "dependencies": {
     "@synapse/protocol": "file:vendor/synapse-protocol-0.1.0.tgz",
+    "@synapse/tokens": "file:vendor/synapse-tokens-0.1.0.tgz",
     "socket.io-client": "^4.7.5"
   },
   "devDependencies": {

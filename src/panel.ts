@@ -2,14 +2,38 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
 import * as path from 'path';
+import { generateAllThemesCss } from '@synapse/tokens';
+import { SynapseRestClient } from '@synapse/protocol';
 import { EditorContextWatcher } from './editorContext';
 import { FileAttachmentQueue, QueuedFile } from './fileAttachmentQueue';
+
+// Shared design tokens (see synapse-tokens/src/web.ts) as CSS custom
+// properties (--synapse-you, --synapse-accent, etc.), computed once at
+// module load. Injected additively at the top of the <style> block below —
+// the existing hardcoded hex rules in this file are untouched and keep
+// rendering exactly as before; consuming var(--synapse-*) instead of a
+// literal hex in those rules is the natural next step, not done here to
+// keep this change to "make the tokens present and inspectable", not a
+// rewrite of every rule in a file this session hasn't otherwise touched.
+const SYNAPSE_TOKENS_CSS = generateAllThemesCss();
 
 export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
     public static readonly viewId = 'synapse.chatView';
     private view?: vscode.WebviewView;
     private pingTimer?: ReturnType<typeof setInterval>;
     private serverUrl = 'http://localhost:5000';
+    // true once the iframe was built WITH a real ?ctxid=. If resolveWebviewView
+    // fired before the extension's context id was ready (session restoration
+    // can race ahead of activate() — see buildFrameUrl()), this stays false and
+    // syncContextId() rebuilds the iframe the moment a real id shows up,
+    // instead of leaving the WebUI stuck on the random id it picked for itself.
+    private frameHasCtxId = false;
+    // Fase 2 - D*HUD (docs/decisions/2026-08-17-vscode-hud-not-walkthrough.md).
+    // Uses the shared, typed REST client (Fase 1's usage_summary/token_status
+    // + Fase 2's session_goal endpoints) instead of hand-rolling another raw
+    // http.get pair like sendMessageWithAttachments below does — that method
+    // predates @synapse/protocol having a client worth reusing.
+    private readonly restClient: SynapseRestClient;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -19,6 +43,7 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
         this.serverUrl = vscode.workspace
             .getConfiguration('synapse')
             .get<string>('serverUrl', 'http://localhost:5000');
+        this.restClient = new SynapseRestClient({ serverUrl: this.serverUrl });
     }
 
     resolveWebviewView(
@@ -85,21 +110,69 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
         // this extension's context_id never reaches the chat the user sees.
         const contextId = this.watcher.getContextId();
         if (!contextId) {
+            this.frameHasCtxId = false;
             return this.serverUrl;
         }
         try {
             const url = new URL(this.serverUrl);
             url.searchParams.set('ctxid', contextId);
+            this.frameHasCtxId = true;
             return url.toString();
         } catch {
+            this.frameHasCtxId = false;
             return this.serverUrl;
         }
+    }
+
+    // Called from watcher.setContextIdCallback on every context id
+    // (re)application (activation's redundant applyActiveContextId() pass,
+    // synapse.setContextId, workspace-folder changes). No-ops once the
+    // iframe already has a real ctxid — this only exists to self-heal the
+    // race where resolveWebviewView ran before the id was ready and the
+    // WebUI already latched onto its own random chat id.
+    syncContextId(): void {
+        if (this.frameHasCtxId || !this.view) { return; }
+        if (!this.watcher.getContextId()) { return; }
+        const frameUrl = this.buildFrameUrl();
+        this.view.webview.html = this.buildHtml(frameUrl);
     }
 
     private startPing() {
         if (this.pingTimer) { clearInterval(this.pingTimer); }
         this.ping();
-        this.pingTimer = setInterval(() => this.ping(), 15000);
+        void this.refreshHud();
+        this.pingTimer = setInterval(() => { this.ping(); void this.refreshHud(); }, 15000);
+    }
+
+    // Fase 2 - D*HUD: no turn-completion event to hook here the way
+    // synapse-cli's App.tsx does (ws.onComplete) — this panel is chrome
+    // around an iframe of the WebUI; the actual chat session lives inside
+    // that iframe, invisible to this class. Piggybacking on the existing
+    // 15s ping interval is the only recurring cycle already established,
+    // and token_status.py's own docstring notes ctx_window only changes
+    // once per LLM turn anyway, so 15s is a reasonable enough cadence
+    // without inventing a second polling loop.
+    private async refreshHud() {
+        const contextId = this.watcher.getContextId();
+        if (!contextId) { return; }
+
+        const apiToken = vscode.workspace.getConfiguration('synapse').get<string>('apiToken', '');
+        this.restClient.updateApiToken(apiToken);
+
+        try {
+            const [tokenStatus, goalStatus] = await Promise.all([
+                this.restClient.getTokenStatus(contextId),
+                this.restClient.getSessionGoal(contextId),
+            ]);
+            this.view?.webview.postMessage({
+                type: 'hud_update',
+                tokenCount: tokenStatus.token_count,
+                contextWindow: tokenStatus.context_window,
+                goal: goalStatus.goal,
+            });
+        } catch {
+            // Best-effort — the HUD just keeps showing its last known values.
+        }
     }
 
     private ping() {
@@ -200,6 +273,8 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none'; frame-src *; script-src 'unsafe-inline'; style-src 'unsafe-inline';">
   <style>
+    ${SYNAPSE_TOKENS_CSS}
+
     * { margin:0; padding:0; box-sizing:border-box; }
 
     #bar {
@@ -220,6 +295,22 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
       max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     }
     #pill.warn { border-color:#a07820;color:#c9a227; }
+    /* Fase 2 - D*HUD (docs/decisions/2026-08-17-vscode-hud-not-walkthrough.md):
+       token/goal strip, refreshed alongside the existing 15s ping. Colors
+       reuse @synapse/tokens' shared roles (Fase 1 - F) — same warn/error
+       hues the CLI's HUD and the WebUI use, not new one-off values. */
+    #hud {
+      background:#2a2a2a;border:1px solid #3a3a3a;border-radius:8px;
+      padding:1px 6px;font-size:10px;color:#888;
+      max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    }
+    #hud.hidden { display:none; }
+    #hud.hud-warn { border-color:#a07820; color:var(--synapse-warn, #c9a227); }
+    #hud.hud-crit { border-color:#7a2c22; color:var(--synapse-error, #f44336); }
+    #hud .goal-active { color:var(--synapse-accent, #4fc1ff); }
+    #hud .goal-paused { color:#888; }
+    #hud .goal-blocked { color:var(--synapse-error, #f44336); }
+    #hud .goal-budget_limited { color:var(--synapse-warn, #c9a227); }
     #attach-btn {
       background:none;border:none;cursor:pointer;
       color:#888;font-size:14px;padding:0 2px;line-height:1;
@@ -291,6 +382,7 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
     <span id="dot"></span>
     <span id="bar-txt">Connecting…</span>
     <span id="pill">no file open</span>
+    <span id="hud" class="hidden"></span>
     <button id="attach-btn" title="Attach file to next message (Ctrl+Shift+A)">📎</button>
   </div>
   <div id="chips-bar"></div>
@@ -312,6 +404,7 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
     const dot       = document.getElementById('dot');
     const bartxt    = document.getElementById('bar-txt');
     const pill      = document.getElementById('pill');
+    const hud       = document.getElementById('hud');
     const frame     = document.getElementById('frame');
     const splash    = document.getElementById('splash');
     const chipsBar  = document.getElementById('chips-bar');
@@ -377,11 +470,46 @@ export class SynapseSidebarProvider implements vscode.WebviewViewProvider {
       sendInput.focus();
     }
 
+    function renderHud(data) {
+      const parts = [];
+
+      if (data.tokenCount != null && data.contextWindow > 0) {
+        const ratio = data.tokenCount / data.contextWindow;
+        const pct = Math.round(ratio * 100);
+        parts.push({
+          text: data.tokenCount.toLocaleString() + '/' + data.contextWindow.toLocaleString() + ' tok (' + pct + '%)',
+          cls: ratio >= 0.9 ? 'hud-crit' : ratio >= 0.7 ? 'hud-warn' : '',
+        });
+      }
+
+      if (data.goal) {
+        const label = data.goal.status === 'active'
+          ? 'goal: active (' + data.goal.turns_used + ')'
+          : 'goal: ' + data.goal.status;
+        parts.push({ text: label, cls: 'goal-' + data.goal.status });
+      }
+
+      if (parts.length === 0) {
+        hud.classList.add('hidden');
+        hud.textContent = '';
+        return;
+      }
+
+      // Only one badge fits comfortably in the top bar — token pressure wins
+      // when both are present, since it's the one that can actually block
+      // the next turn; the goal strip is still one /goal away in the chat.
+      const shown = parts[0];
+      hud.className = shown.cls;
+      hud.textContent = shown.text;
+      hud.title = parts.map(p => p.text).join(' — ');
+    }
+
     window.addEventListener('message', e => {
       const msg = e.data;
       if (!msg || !msg.type) return;
 
       if (msg.type === 'ping') { setOnline(msg.ok); return; }
+      if (msg.type === 'hud_update') { renderHud(msg); return; }
 
       if (msg.type === 'editor_state') {
         const name = msg.file ? msg.file.replace(/.*[\\\\/]/, '') : '';
